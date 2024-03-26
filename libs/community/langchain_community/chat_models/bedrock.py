@@ -300,6 +300,57 @@ class BedrockChat(BaseChatModel, BedrockBase):
             generations=[ChatGeneration(message=AIMessage(content=completion))]
         )
 
+    async def _astream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[ChatGenerationChunk, None]:
+        provider = self._get_provider()
+        system = None
+        formatted_messages = None
+        
+        if provider == "anthropic":
+            prompt = None
+            system, formatted_messages = ChatPromptAdapter.format_messages(
+                provider, messages
+            )
+        else:
+            prompt = ChatPromptAdapter.convert_messages_to_prompt(
+                provider=provider, messages=messages
+            )
+
+        async for chunk in self._aprepare_input_and_invoke_stream(
+            prompt=prompt,
+            system=system,
+            messages=formatted_messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        ):
+            delta = chunk.text
+            yield ChatGenerationChunk(message=AIMessageChunk(content=delta))
+    
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        completion = ""
+
+        if not self.streaming:
+            raise ValueError("Streaming must be set to True for async operations. ")
+        
+        async for chunk in self._astream(messages, stop, run_manager, **kwargs):
+                completion += chunk.text
+                
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=completion))]
+        )
+        
     def get_num_tokens(self, text: str) -> int:
         if self._model_is_anthropic:
             return get_num_tokens_anthropic(text)
