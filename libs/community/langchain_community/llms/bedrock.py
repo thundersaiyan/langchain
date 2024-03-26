@@ -240,14 +240,21 @@ class LLMInputOutputAdapter:
 
     @classmethod
     async def aprepare_output_stream(
-        cls, provider: str, response: Any, stop: Optional[List[str]] = None
+        cls,
+        provider: str,
+        response: Any,
+        stop: Optional[List[str]] = None,
+        messages_api: bool = False,
     ) -> AsyncIterator[GenerationChunk]:
         stream = response.get("body")
 
         if not stream:
             return
 
-        output_key = cls.provider_to_output_key_map.get(provider, None)
+        if messages_api:
+            output_key = "message"
+        else:
+            output_key = cls.provider_to_output_key_map.get(provider, "")
 
         if not output_key:
             raise ValueError(
@@ -266,19 +273,41 @@ class LLMInputOutputAdapter:
             ):
                 return
 
-            if (
+            elif (
                 provider == "mistral"
                 and chunk_obj.get(output_key, [{}])[0].get("stop_reason", "") == "stop"
             ):
                 return
 
-            yield GenerationChunk(
-                text=(
-                    chunk_obj[output_key]
-                    if provider != "mistral"
-                    else chunk_obj[output_key][0]["text"]
+            elif messages_api and (chunk_obj.get("type") == "content_block_stop"):
+                return
+
+            if messages_api and chunk_obj.get("type") in (
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+            ):
+                if chunk_obj.get("type") == "content_block_delta":
+                    chk = _stream_response_to_generation_chunk(chunk_obj)
+                    yield chk
+                else:
+                    continue
+            else:
+                # chunk obj format varies with provider
+                yield GenerationChunk(
+                    text=(
+                        chunk_obj[output_key]
+                        if provider != "mistral"
+                        else chunk_obj[output_key][0]["text"]
+                    ),
+                    generation_info={
+                        GUARDRAILS_BODY_KEY: (
+                            chunk_obj.get(GUARDRAILS_BODY_KEY)
+                            if GUARDRAILS_BODY_KEY in chunk_obj
+                            else None
+                        ),
+                    },
                 )
-            )
 
 
 class BedrockBase(BaseModel, ABC):
@@ -654,6 +683,8 @@ class BedrockBase(BaseModel, ABC):
     async def _aprepare_input_and_invoke_stream(
         self,
         prompt: str,
+        system: Optional[str] = None,
+        messages: Optional[List[Dict]] = None,
         stop: Optional[List[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
@@ -666,29 +697,48 @@ class BedrockBase(BaseModel, ABC):
                 raise ValueError(
                     f"Stop sequence key name for {provider} is not supported."
                 )
+
+            # stop sequence from _generate() overrides
+            # stop sequences in the class attribute
             _model_kwargs[self.provider_stop_sequence_key_name_map.get(provider)] = stop
 
         if provider == "cohere":
             _model_kwargs["stream"] = True
 
         params = {**_model_kwargs, **kwargs}
+
+        if self._guardrails_enabled:
+            params.update(self._get_guardrails_canonical())
+
         input_body = LLMInputOutputAdapter.prepare_input(
-            provider=provider, prompt=prompt, model_kwargs=params
+            provider=provider,
+            prompt=prompt,
+            system=system,
+            messages=messages,
+            model_kwargs=params,
         )
         body = json.dumps(input_body)
+
+        request_options = {
+            "body": body,
+            "modelId": self.model_id,
+            "accept": "application/json",
+            "contentType": "application/json",
+        }
+
+        if self._guardrails_enabled:
+            request_options["guardrail"] = "ENABLED"
+            if self.guardrails.get("trace"):  # type: ignore[union-attr]
+                request_options["trace"] = "ENABLED"
 
         response = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: self.client.invoke_model_with_response_stream(
-                body=body,
-                modelId=self.model_id,
-                accept="application/json",
-                contentType="application/json",
+                **request_options
             ),
         )
-
         async for chunk in LLMInputOutputAdapter.aprepare_output_stream(
-            provider, response, stop
+            provider, response, stop, True if messages else False
         ):
             yield chunk
             if run_manager is not None and asyncio.iscoroutinefunction(
@@ -696,7 +746,7 @@ class BedrockBase(BaseModel, ABC):
             ):
                 await run_manager.on_llm_new_token(chunk.text, chunk=chunk)
             elif run_manager is not None:
-                run_manager.on_llm_new_token(chunk.text, chunk=chunk)  # type: ignore[unused-coroutine]
+                run_manager.on_llm_new_token(chunk.text, chunk=chunk) # type: ignore[unused-coroutine]
 
 
 class Bedrock(LLM, BedrockBase):
